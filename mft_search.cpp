@@ -8,6 +8,7 @@
 #define _WIN32_WINNT 0x0600
 #endif
 #include <windows.h>
+#include <windowsx.h>
 #include <winioctl.h>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -19,6 +20,17 @@
 #include <commctrl.h>
 #include <shellapi.h>
 
+#define IDM_SORT_NAME       40001
+#define IDM_SORT_PATH       40002
+#define IDM_SORT_SIZE       40003
+#define IDM_SORT_EXTENSION  40004
+#define IDM_SORT_DATEMOD    40005
+#define IDM_SORT_DATECRE    40006
+#define IDM_SORT_DATEACC    40007
+#define IDM_SORT_ASC        40010
+#define IDM_SORT_DESC       40011
+#define IDM_REFRESH         40020
+
 struct FileEntry {
     DWORDLONG frn;
     DWORDLONG parentFrn;
@@ -28,10 +40,11 @@ struct FileEntry {
     wchar_t drive;
 };
 
-HWND hEdit, hList, hLblStatus;
+HWND hEdit, hList, hLblStatus, hBtnView;
 HFONT g_hFont = NULL;
 std::vector<FileEntry> g_allFiles;
 std::unordered_map<DWORDLONG, size_t> g_frnMaps[26];
+HMENU g_hSortMenu = NULL;
 
 std::wstring GetFullPath(size_t index) {
     const FileEntry& entry = g_allFiles[index];
@@ -78,6 +91,16 @@ std::wstring FormatTime(FILETIME ft) {
     return std::wstring(buf);
 }
 
+std::wstring GetExtension(const std::wstring& name) {
+    size_t dot = name.rfind(L'.');
+    if (dot != std::wstring::npos) {
+        std::wstring ext = name.substr(dot);
+        for (auto& c : ext) c = towlower(c);
+        return ext;
+    }
+    return L"";
+}
+
 // sorting globals
 int g_sortColumn = -1;
 bool g_sortAscending = true;
@@ -116,6 +139,28 @@ int CALLBACK CompareListViewItems(LPARAM lParam1, LPARAM lParam2, LPARAM lParamS
         
         if (u1.QuadPart < u2.QuadPart) cmp = -1;
         else if (u1.QuadPart > u2.QuadPart) cmp = 1;
+    } else if (g_sortColumn == 4) {
+        cmp = wcsicmp(GetExtension(g_allFiles[idx1].name).c_str(), GetExtension(g_allFiles[idx2].name).c_str());
+    } else if (g_sortColumn == 5) {
+        WIN32_FILE_ATTRIBUTE_DATA fad1, fad2;
+        FILETIME ft1 = {0}, ft2 = {0};
+        if (GetFileAttributesExW(GetFullPath(idx1).c_str(), GetFileExInfoStandard, &fad1)) ft1 = fad1.ftCreationTime;
+        if (GetFileAttributesExW(GetFullPath(idx2).c_str(), GetFileExInfoStandard, &fad2)) ft2 = fad2.ftCreationTime;
+        ULARGE_INTEGER uc1, uc2;
+        uc1.LowPart = ft1.dwLowDateTime; uc1.HighPart = ft1.dwHighDateTime;
+        uc2.LowPart = ft2.dwLowDateTime; uc2.HighPart = ft2.dwHighDateTime;
+        if (uc1.QuadPart < uc2.QuadPart) cmp = -1;
+        else if (uc1.QuadPart > uc2.QuadPart) cmp = 1;
+    } else if (g_sortColumn == 6) {
+        WIN32_FILE_ATTRIBUTE_DATA fad1, fad2;
+        FILETIME ft1 = {0}, ft2 = {0};
+        if (GetFileAttributesExW(GetFullPath(idx1).c_str(), GetFileExInfoStandard, &fad1)) ft1 = fad1.ftLastAccessTime;
+        if (GetFileAttributesExW(GetFullPath(idx2).c_str(), GetFileExInfoStandard, &fad2)) ft2 = fad2.ftLastAccessTime;
+        ULARGE_INTEGER ua1, ua2;
+        ua1.LowPart = ft1.dwLowDateTime; ua1.HighPart = ft1.dwHighDateTime;
+        ua2.LowPart = ft2.dwLowDateTime; ua2.HighPart = ft2.dwHighDateTime;
+        if (ua1.QuadPart < ua2.QuadPart) cmp = -1;
+        else if (ua1.QuadPart > ua2.QuadPart) cmp = 1;
     }
 
     return g_sortAscending ? cmp : -cmp;
@@ -134,6 +179,18 @@ void UpdateSortArrow(HWND hList) {
         }
         Header_SetItem(hHeader, i, &hdi);
     }
+}
+
+void UpdateSortMenuChecks() {
+    if (!g_hSortMenu) return;
+    int sortIds[] = { IDM_SORT_NAME, IDM_SORT_PATH, IDM_SORT_SIZE, IDM_SORT_EXTENSION, IDM_SORT_DATEMOD, IDM_SORT_DATECRE, IDM_SORT_DATEACC };
+    // Map g_sortColumn: 0=Name,1=Path,2=Size,3=DateMod,4=Ext,5=DateCre,6=DateAcc
+    // Menu order: Name(0),Path(1),Size(2),Ext(3->4),DateMod(4->3),DateCre(5),DateAcc(6)
+    for (int i = 0; i < 7; i++) CheckMenuItem(g_hSortMenu, sortIds[i], MF_UNCHECKED);
+    int colToMenuIdx[] = { 0, 1, 2, 4, 3, 5, 6 };
+    if (g_sortColumn >= 0 && g_sortColumn <= 6) CheckMenuItem(g_hSortMenu, sortIds[colToMenuIdx[g_sortColumn]], MF_CHECKED);
+    CheckMenuItem(g_hSortMenu, IDM_SORT_ASC, g_sortAscending ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(g_hSortMenu, IDM_SORT_DESC, g_sortAscending ? MF_UNCHECKED : MF_CHECKED);
 }
 
 void ScanDrive(wchar_t driveLetter) {
@@ -407,18 +464,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(hList, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
             SendMessage(hEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(10, 10));
+
+            hBtnView = CreateWindowW(L"BUTTON", L"View \x25B2",
+                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                     10, 0, 60, 22, hwnd, (HMENU)1001, NULL, NULL);
+            SendMessage(hBtnView, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             break;
         }
         case WM_SIZE: {
             if (hEdit && hList && hLblStatus) {
                 int width = LOWORD(lParam);
                 int height = HIWORD(lParam);
-                // Search at the top with a bit more margin
                 MoveWindow(hEdit, 10, 12, width - 20, 24, TRUE);
-                // List in the middle
                 MoveWindow(hList, 10, 42, width - 20, height - 72, TRUE);
-                // Status at the bottom
-                MoveWindow(hLblStatus, 10, height - 25, width - 20, 20, TRUE);
+                // View button at bottom-left, status label to its right
+                MoveWindow(hBtnView, 10, height - 27, 60, 22, TRUE);
+                MoveWindow(hLblStatus, 78, height - 25, width - 88, 20, TRUE);
             }
             break;
         }
@@ -449,6 +510,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     ListView_SortItems(hList, CompareListViewItems, 0);
                     UpdateSortArrow(hList);
+                    UpdateSortMenuChecks();
                 }
             }
             break;
@@ -458,34 +520,87 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (HIWORD(wParam) == EN_CHANGE) {
                     PerformSearch();
                 }
+            } else if (LOWORD(wParam) == 1001 && (HWND)lParam == hBtnView) {
+                // View button clicked - show sort popup above the button
+                RECT rc;
+                GetWindowRect(hBtnView, &rc);
+                UpdateSortMenuChecks();
+                TrackPopupMenu(g_hSortMenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, rc.left, rc.top, 0, hwnd, NULL);
+            } else {
+                int menuId = LOWORD(wParam);
+                int newSortCol = -1;
+                switch (menuId) {
+                    case IDM_SORT_NAME:      newSortCol = 0; break;
+                    case IDM_SORT_PATH:      newSortCol = 1; break;
+                    case IDM_SORT_SIZE:      newSortCol = 2; break;
+                    case IDM_SORT_EXTENSION: newSortCol = 4; break;
+                    case IDM_SORT_DATEMOD:   newSortCol = 3; break;
+                    case IDM_SORT_DATECRE:   newSortCol = 5; break;
+                    case IDM_SORT_DATEACC:   newSortCol = 6; break;
+                    case IDM_SORT_ASC:
+                        g_sortAscending = true;
+                        if (g_sortColumn >= 0) { ListView_SortItems(hList, CompareListViewItems, 0); UpdateSortArrow(hList); }
+                        UpdateSortMenuChecks();
+                        break;
+                    case IDM_SORT_DESC:
+                        g_sortAscending = false;
+                        if (g_sortColumn >= 0) { ListView_SortItems(hList, CompareListViewItems, 0); UpdateSortArrow(hList); }
+                        UpdateSortMenuChecks();
+                        break;
+                    case IDM_REFRESH:
+                        SetWindowTextW(hLblStatus, L"Refreshing index...");
+                        BuildFileIndex();
+                        PerformSearch();
+                        break;
+                }
+                if (newSortCol >= 0) {
+                    if (g_sortColumn == newSortCol) g_sortAscending = !g_sortAscending;
+                    else { g_sortColumn = newSortCol; g_sortAscending = true; }
+                    ListView_SortItems(hList, CompareListViewItems, 0);
+                    UpdateSortArrow(hList);
+                    UpdateSortMenuChecks();
+                }
             }
             break;
         }
         case WM_CONTEXTMENU: {
             if ((HWND)wParam == hList) {
-                int selRow = SendMessageW(hList, LVM_GETNEXTITEM, -1, LVNI_SELECTED);
-                if (selRow != -1) {
+                POINT pt;
+                if (lParam == -1) {
+                    pt.x = 0; pt.y = 0;
+                    ClientToScreen(hList, &pt);
+                } else {
+                    pt.x = GET_X_LPARAM(lParam);
+                    pt.y = GET_Y_LPARAM(lParam);
+                }
+
+                // Hit-test to see if right-click is on an item
+                LVHITTESTINFO hti = {0};
+                hti.pt.x = pt.x; hti.pt.y = pt.y;
+                ScreenToClient(hList, &hti.pt);
+                int hitItem = (int)SendMessageW(hList, LVM_HITTEST, 0, (LPARAM)&hti);
+
+                if (hitItem != -1) {
+                    // Clicked on an item - show shell context menu
                     LVITEMW lvi = {0};
                     lvi.mask = LVIF_PARAM;
-                    lvi.iItem = selRow;
+                    lvi.iItem = hitItem;
                     SendMessageW(hList, LVM_GETITEMW, 0, (LPARAM)&lvi);
-                    
                     size_t idx = (size_t)lvi.lParam;
                     if (idx != (size_t)-1) {
-                        POINT pt;
-                        if (lParam == -1) {
-                            RECT rc;
-                            ListView_GetItemRect(hList, selRow, &rc, LVIR_BOUNDS);
-                            pt.x = rc.left + 5;
-                            pt.y = rc.top + 5;
-                            ClientToScreen(hList, &pt);
-                        } else {
-                            pt.x = LOWORD(lParam);
-                            pt.y = HIWORD(lParam);
-                        }
-                        
                         ShowShellContextMenu(hwnd, GetFullPath(idx), pt);
                     }
+                } else {
+                    // Clicked on empty space - show Refresh + Sort by menu
+                    HMENU hCtxMenu = CreatePopupMenu();
+                    AppendMenuW(hCtxMenu, MF_STRING, IDM_REFRESH, L"Refresh\tF5");
+                    AppendMenuW(hCtxMenu, MF_SEPARATOR, 0, NULL);
+                    UpdateSortMenuChecks();
+                    AppendMenuW(hCtxMenu, MF_POPUP, (UINT_PTR)g_hSortMenu, L"Sort by");
+                    TrackPopupMenu(hCtxMenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+                    // Remove the submenu reference before destroying so g_hSortMenu survives
+                    RemoveMenu(hCtxMenu, 2, MF_BYPOSITION);
+                    DestroyMenu(hCtxMenu);
                 }
             }
             break;
@@ -512,6 +627,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     RegisterClassW(&wc);
 
+    g_hSortMenu = CreatePopupMenu();
+    AppendMenuW(g_hSortMenu, MF_STRING, IDM_SORT_NAME,      L"Name\tCtrl+1");
+    AppendMenuW(g_hSortMenu, MF_STRING, IDM_SORT_PATH,      L"Path\tCtrl+2");
+    AppendMenuW(g_hSortMenu, MF_STRING, IDM_SORT_SIZE,      L"Size\tCtrl+3");
+    AppendMenuW(g_hSortMenu, MF_STRING, IDM_SORT_EXTENSION, L"Extension\tCtrl+4");
+    AppendMenuW(g_hSortMenu, MF_STRING, IDM_SORT_DATEMOD,   L"Date Modified\tCtrl+5");
+    AppendMenuW(g_hSortMenu, MF_STRING, IDM_SORT_DATECRE,   L"Date Created\tCtrl+6");
+    AppendMenuW(g_hSortMenu, MF_STRING, IDM_SORT_DATEACC,   L"Date Accessed\tCtrl+7");
+    AppendMenuW(g_hSortMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(g_hSortMenu, MF_STRING, IDM_SORT_ASC,       L"Ascending");
+    AppendMenuW(g_hSortMenu, MF_STRING, IDM_SORT_DESC,      L"Descending");
+
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"MFT Search",
                               WS_OVERLAPPEDWINDOW, 
                               CW_USEDEFAULT, CW_USEDEFAULT, 1000, 600,
@@ -522,10 +649,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     BuildFileIndex();
 
+    ACCEL accels[] = {
+        { FCONTROL | FVIRTKEY, '1', IDM_SORT_NAME },
+        { FCONTROL | FVIRTKEY, '2', IDM_SORT_PATH },
+        { FCONTROL | FVIRTKEY, '3', IDM_SORT_SIZE },
+        { FCONTROL | FVIRTKEY, '4', IDM_SORT_EXTENSION },
+        { FCONTROL | FVIRTKEY, '5', IDM_SORT_DATEMOD },
+        { FCONTROL | FVIRTKEY, '6', IDM_SORT_DATECRE },
+        { FCONTROL | FVIRTKEY, '7', IDM_SORT_DATEACC },
+        { FVIRTKEY, VK_F5, IDM_REFRESH },
+    };
+    HACCEL hAccel = CreateAcceleratorTableW(accels, 8);
+
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        if (!TranslateAcceleratorW(hwnd, hAccel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
     }
+    DestroyAcceleratorTable(hAccel);
     return (int)msg.wParam;
 }
