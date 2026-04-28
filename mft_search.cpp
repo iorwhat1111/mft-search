@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <regex>
 
 #define IDM_SORT_NAME       40001
 #define IDM_SORT_PATH       40002
@@ -31,6 +32,21 @@
 #define IDM_SORT_DESC       40011
 #define IDM_REFRESH         40020
 
+#define IDM_MATCH_CASE      40030
+#define IDM_MATCH_WORD      40031
+#define IDM_MATCH_PATH      40032
+#define IDM_MATCH_DIACRITICS 40033
+#define IDM_ENABLE_REGEX    40034
+
+#define IDM_FILTER_ALL      40050
+#define IDM_FILTER_AUDIO    40051
+#define IDM_FILTER_COMPRESSED 40052
+#define IDM_FILTER_DOCUMENT 40053
+#define IDM_FILTER_EXECUTABLE 40054
+#define IDM_FILTER_FOLDER   40055
+#define IDM_FILTER_PICTURE  40056
+#define IDM_FILTER_VIDEO    40057
+
 struct FileEntry {
     DWORDLONG frn;
     DWORDLONG parentFrn;
@@ -40,11 +56,41 @@ struct FileEntry {
     wchar_t drive;
 };
 
-HWND hEdit, hList, hLblStatus, hBtnView;
+HWND hEdit, hList, hLblStatus, hBtnView, hBtnSearch;
 HFONT g_hFont = NULL;
 std::vector<FileEntry> g_allFiles;
 std::unordered_map<DWORDLONG, size_t> g_frnMaps[26];
 HMENU g_hSortMenu = NULL;
+
+// Search match options
+bool g_matchCase = false;
+bool g_matchWord = false;
+bool g_matchPath = false;
+bool g_matchDiacritics = false;
+bool g_enableRegex = false;
+int  g_activeFilter = IDM_FILTER_ALL;
+
+bool MatchesExtensionFilter(const std::wstring& nameLower) {
+    if (g_activeFilter == IDM_FILTER_ALL) return true;
+    size_t dot = nameLower.rfind(L'.');
+    if (dot == std::wstring::npos) return (g_activeFilter == IDM_FILTER_ALL);
+    std::wstring ext = nameLower.substr(dot);
+    switch (g_activeFilter) {
+        case IDM_FILTER_AUDIO:
+            return ext==L".mp3"||ext==L".wav"||ext==L".flac"||ext==L".aac"||ext==L".ogg"||ext==L".wma"||ext==L".m4a"||ext==L".opus";
+        case IDM_FILTER_COMPRESSED:
+            return ext==L".zip"||ext==L".rar"||ext==L".7z"||ext==L".tar"||ext==L".gz"||ext==L".bz2"||ext==L".xz"||ext==L".cab";
+        case IDM_FILTER_DOCUMENT:
+            return ext==L".doc"||ext==L".docx"||ext==L".pdf"||ext==L".txt"||ext==L".rtf"||ext==L".xls"||ext==L".xlsx"||ext==L".ppt"||ext==L".pptx"||ext==L".odt"||ext==L".csv";
+        case IDM_FILTER_EXECUTABLE:
+            return ext==L".exe"||ext==L".msi"||ext==L".bat"||ext==L".cmd"||ext==L".com"||ext==L".scr"||ext==L".ps1";
+        case IDM_FILTER_PICTURE:
+            return ext==L".jpg"||ext==L".jpeg"||ext==L".png"||ext==L".gif"||ext==L".bmp"||ext==L".tiff"||ext==L".svg"||ext==L".webp"||ext==L".ico";
+        case IDM_FILTER_VIDEO:
+            return ext==L".mp4"||ext==L".avi"||ext==L".mkv"||ext==L".mov"||ext==L".wmv"||ext==L".flv"||ext==L".webm"||ext==L".m4v";
+        default: return true;
+    }
+}
 
 std::wstring GetFullPath(size_t index) {
     const FileEntry& entry = g_allFiles[index];
@@ -308,11 +354,49 @@ void PerformSearch() {
 
     for (auto& c : query) c = towlower(c);
 
+    std::wstring queryOriginal(queryBuf);
+
     int foundCount = 0;
     int row = 0;
 
     for (size_t i = 0; i < g_allFiles.size(); i++) {
-        if (g_allFiles[i].nameLower.find(query) != std::wstring::npos) {
+        // Filter by file type
+        if (g_activeFilter == IDM_FILTER_FOLDER) {
+            if (!(g_allFiles[i].attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        } else if (g_activeFilter != IDM_FILTER_ALL) {
+            if (g_allFiles[i].attr & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (!MatchesExtensionFilter(g_allFiles[i].nameLower)) continue;
+        }
+
+        // Determine search target and query based on options
+        bool matched = false;
+        if (g_enableRegex) {
+            try {
+                std::wstring target = g_matchPath ? GetFullPath(i) : g_allFiles[i].name;
+                std::wregex re(queryOriginal, g_matchCase ? std::regex_constants::extended : (std::regex_constants::extended | std::regex_constants::icase));
+                matched = std::regex_search(target, re);
+            } catch (...) {
+                // Invalid regex, maybe show an error once?
+                matched = false;
+            }
+        } else if (g_matchCase) {
+            const std::wstring& target = g_matchPath ? GetFullPath(i) : g_allFiles[i].name;
+            if (g_matchWord) {
+                matched = (target == queryOriginal);
+            } else {
+                matched = (target.find(queryOriginal) != std::wstring::npos);
+            }
+        } else {
+            std::wstring target = g_matchPath ? GetFullPath(i) : g_allFiles[i].nameLower;
+            if (g_matchPath) { for (auto& c : target) c = towlower(c); }
+            if (g_matchWord) {
+                matched = (target == query);
+            } else {
+                matched = (target.find(query) != std::wstring::npos);
+            }
+        }
+
+        if (matched) {
             std::wstring fullPath = GetFullPath(i);
             
             SHFILEINFOW sfi = {0};
@@ -469,6 +553,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                      10, 0, 60, 22, hwnd, (HMENU)1001, NULL, NULL);
             SendMessage(hBtnView, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+
+            hBtnSearch = CreateWindowW(L"BUTTON", L"Search \x25B2",
+                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       75, 0, 75, 22, hwnd, (HMENU)1002, NULL, NULL);
+            SendMessage(hBtnSearch, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             break;
         }
         case WM_SIZE: {
@@ -477,9 +566,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int height = HIWORD(lParam);
                 MoveWindow(hEdit, 10, 12, width - 20, 24, TRUE);
                 MoveWindow(hList, 10, 42, width - 20, height - 72, TRUE);
-                // View button at bottom-left, status label to its right
+                // View button at bottom-left, Search button next to it, status label to the right
                 MoveWindow(hBtnView, 10, height - 27, 60, 22, TRUE);
-                MoveWindow(hLblStatus, 78, height - 25, width - 88, 20, TRUE);
+                MoveWindow(hBtnSearch, 75, height - 27, 75, 22, TRUE);
+                MoveWindow(hLblStatus, 158, height - 25, width - 168, 20, TRUE);
             }
             break;
         }
@@ -526,6 +616,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 GetWindowRect(hBtnView, &rc);
                 UpdateSortMenuChecks();
                 TrackPopupMenu(g_hSortMenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, rc.left, rc.top, 0, hwnd, NULL);
+            } else if (LOWORD(wParam) == 1002 && (HWND)lParam == hBtnSearch) {
+                // Search button clicked - show match/filter popup above the button
+                HMENU hSearchMenu = CreatePopupMenu();
+                AppendMenuW(hSearchMenu, MF_STRING | (g_matchCase ? MF_CHECKED : 0), IDM_MATCH_CASE, L"Match Case\tCtrl+I");
+                AppendMenuW(hSearchMenu, MF_STRING | (g_matchWord ? MF_CHECKED : 0), IDM_MATCH_WORD, L"Match Whole Word\tCtrl+B");
+                AppendMenuW(hSearchMenu, MF_STRING | (g_matchPath ? MF_CHECKED : 0), IDM_MATCH_PATH, L"Match Path\tCtrl+U");
+                AppendMenuW(hSearchMenu, MF_STRING | (g_matchDiacritics ? MF_CHECKED : 0), IDM_MATCH_DIACRITICS, L"Match Diacritics\tCtrl+M");
+                AppendMenuW(hSearchMenu, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(hSearchMenu, MF_STRING | (g_enableRegex ? MF_CHECKED : 0), IDM_ENABLE_REGEX, L"Enable Regex\tCtrl+R");
+                AppendMenuW(hSearchMenu, MF_SEPARATOR, 0, NULL);
+                int filters[] = { IDM_FILTER_ALL, IDM_FILTER_AUDIO, IDM_FILTER_COMPRESSED, IDM_FILTER_DOCUMENT, IDM_FILTER_EXECUTABLE, IDM_FILTER_FOLDER, IDM_FILTER_PICTURE, IDM_FILTER_VIDEO };
+                const wchar_t* filterNames[] = { L"Everything", L"Audio", L"Compressed", L"Document", L"Executable", L"Folder", L"Picture", L"Video" };
+                for (int fi = 0; fi < 8; fi++) {
+                    AppendMenuW(hSearchMenu, MF_STRING | (g_activeFilter == filters[fi] ? MF_CHECKED : 0), filters[fi], filterNames[fi]);
+                }
+                RECT rc;
+                GetWindowRect(hBtnSearch, &rc);
+                TrackPopupMenu(hSearchMenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, rc.left, rc.top, 0, hwnd, NULL);
+                DestroyMenu(hSearchMenu);
             } else {
                 int menuId = LOWORD(wParam);
                 int newSortCol = -1;
@@ -550,6 +659,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     case IDM_REFRESH:
                         SetWindowTextW(hLblStatus, L"Refreshing index...");
                         BuildFileIndex();
+                        PerformSearch();
+                        break;
+                    case IDM_MATCH_CASE:   g_matchCase = !g_matchCase; PerformSearch(); break;
+                    case IDM_MATCH_WORD:   g_matchWord = !g_matchWord; PerformSearch(); break;
+                    case IDM_MATCH_PATH:   g_matchPath = !g_matchPath; PerformSearch(); break;
+                    case IDM_MATCH_DIACRITICS: g_matchDiacritics = !g_matchDiacritics; PerformSearch(); break;
+                    case IDM_ENABLE_REGEX: g_enableRegex = !g_enableRegex; PerformSearch(); break;
+                    case IDM_FILTER_ALL: case IDM_FILTER_AUDIO: case IDM_FILTER_COMPRESSED:
+                    case IDM_FILTER_DOCUMENT: case IDM_FILTER_EXECUTABLE: case IDM_FILTER_FOLDER:
+                    case IDM_FILTER_PICTURE: case IDM_FILTER_VIDEO:
+                        g_activeFilter = LOWORD(wParam);
                         PerformSearch();
                         break;
                 }
@@ -591,15 +711,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         ShowShellContextMenu(hwnd, GetFullPath(idx), pt);
                     }
                 } else {
-                    // Clicked on empty space - show Refresh + Sort by menu
+                    // Clicked on empty space - show Refresh + Sort by
                     HMENU hCtxMenu = CreatePopupMenu();
                     AppendMenuW(hCtxMenu, MF_STRING, IDM_REFRESH, L"Refresh\tF5");
                     AppendMenuW(hCtxMenu, MF_SEPARATOR, 0, NULL);
                     UpdateSortMenuChecks();
                     AppendMenuW(hCtxMenu, MF_POPUP, (UINT_PTR)g_hSortMenu, L"Sort by");
                     TrackPopupMenu(hCtxMenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-                    // Remove the submenu reference before destroying so g_hSortMenu survives
-                    RemoveMenu(hCtxMenu, 2, MF_BYPOSITION);
+                    // Remove the sort submenu reference before destroying so g_hSortMenu survives
+                    for (int ri = GetMenuItemCount(hCtxMenu) - 1; ri >= 0; ri--) {
+                        MENUITEMINFOW mii = { sizeof(mii) };
+                        mii.fMask = MIIM_SUBMENU;
+                        GetMenuItemInfoW(hCtxMenu, ri, TRUE, &mii);
+                        if (mii.hSubMenu == g_hSortMenu) { RemoveMenu(hCtxMenu, ri, MF_BYPOSITION); break; }
+                    }
                     DestroyMenu(hCtxMenu);
                 }
             }
@@ -658,8 +783,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         { FCONTROL | FVIRTKEY, '6', IDM_SORT_DATECRE },
         { FCONTROL | FVIRTKEY, '7', IDM_SORT_DATEACC },
         { FVIRTKEY, VK_F5, IDM_REFRESH },
+        { FCONTROL | FVIRTKEY, 'I', IDM_MATCH_CASE },
+        { FCONTROL | FVIRTKEY, 'B', IDM_MATCH_WORD },
+        { FCONTROL | FVIRTKEY, 'U', IDM_MATCH_PATH },
+        { FCONTROL | FVIRTKEY, 'M', IDM_MATCH_DIACRITICS },
+        { FCONTROL | FVIRTKEY, 'R', IDM_ENABLE_REGEX },
     };
-    HACCEL hAccel = CreateAcceleratorTableW(accels, 8);
+    HACCEL hAccel = CreateAcceleratorTableW(accels, 13);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
